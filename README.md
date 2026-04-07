@@ -51,7 +51,7 @@
 - `nonebot-adapter-onebot`
 - `redis`
 
-主要配置来自 `.env`。
+主要配置来自本地 `.env`，仓库内提供示例文件 [.env.example](/home/futunan/data/study_code/game_demo/nonebot2/.env.example) 作为参考模板。
 
 ### 3.1 基础通信配置
 
@@ -606,6 +606,9 @@ Dota2 相关代码主要在：
 配置文件：
 
 - `data/dota2_monitor/watch_config.json`
+  - 本地运行时配置，不再纳入版本库
+- `data/dota2_monitor/watch_config.example.json`
+  - 可提交的示例模板
   - 维护昵称与群号映射
 - `data/dota2_monitor/heroes.json`
 - `data/dota2_monitor/items.json`

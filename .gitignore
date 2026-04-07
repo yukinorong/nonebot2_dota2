@@ -1,5 +1,9 @@
 .venv/
+.env
 __pycache__/
 .pytest_cache/
 logs/
-data/dota2_monitor/state.json
+data/
+!data/dota2_monitor/
+data/dota2_monitor/*
+!data/dota2_monitor/watch_config.example.json
