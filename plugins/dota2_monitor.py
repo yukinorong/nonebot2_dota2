@@ -11,7 +11,7 @@ from nonebot.permission import SUPERUSER
 from nonebot.plugin import PluginMetadata
 
 from .common import env, load_env_file
-from .dota2_service import push_recent_matches_with_openclaw, run_dota2_check_once
+from .dota2_service import is_v2_debug_enabled, push_recent_matches_with_openclaw, run_dota2_check_once, set_v2_debug_enabled
 from .dota2_watch_config import list_watch_account_ids
 
 __plugin_meta__ = PluginMetadata(
@@ -37,6 +37,7 @@ DOTA2_V2_STARTUP_BACKFILL_MATCHES = max(0, int(env(ENV_VALUES, "DOTA2_V2_STARTUP
 driver = get_driver()
 dota_check = on_command("dota_check", priority=5, block=True, permission=SUPERUSER)
 dota_backfill_v2 = on_command("dota_backfill_v2", priority=5, block=True, permission=SUPERUSER)
+dota_debug = on_command("dota_debug", priority=5, block=True, permission=SUPERUSER)
 _poller_task: asyncio.Task[None] | None = None
 
 
@@ -96,3 +97,18 @@ async def _handle_dota_backfill_v2(args: Message = CommandArg()) -> None:
     if not summaries:
         await dota_backfill_v2.finish("v2 补推完成，但没有发送任何比赛。")
     await dota_backfill_v2.finish("v2 补推完成：\n" + "\n".join(summaries))
+
+
+@dota_debug.handle()
+async def _handle_dota_debug(args: Message = CommandArg()) -> None:
+    raw = str(args).strip().lower()
+    if raw in {"", "status"}:
+        status = "on" if is_v2_debug_enabled() else "off"
+        await dota_debug.finish(f"Dota2 v2 debug 当前状态：{status}")
+    if raw in {"on", "true", "1", "enable", "enabled"}:
+        set_v2_debug_enabled(True)
+        await dota_debug.finish("Dota2 v2 debug 已开启。")
+    if raw in {"off", "false", "0", "disable", "disabled"}:
+        set_v2_debug_enabled(False)
+        await dota_debug.finish("Dota2 v2 debug 已关闭。")
+    await dota_debug.finish("用法: /dota_debug on|off|status")

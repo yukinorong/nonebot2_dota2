@@ -17,7 +17,17 @@ from typing import Any
 from nonebot import logger
 
 from .common import pick_bot, send_group_text
-from .llm_gateway import ask_dota
+from .llm_gateway import ask_dota, ask_main
+from .runtime_state_store import get_bool_flag, set_bool_flag
+from .dota2_match_store import (
+    get_recent_account_analysis,
+    get_recent_account_matches,
+    has_raw_match,
+    rebuild_player_match_analysis_from_raw_matches,
+    save_raw_match_and_analysis,
+)
+from .dota_player_profile import build_player_profile_features
+from .dota_guide import build_hero_guide_text as _build_hero_guide_text
 from .dota2_watch_config import (
     display_name_for_account as _config_display_name_for_account,
     group_ids_for_account,
@@ -71,6 +81,7 @@ def _watched_account_ids() -> list[str]:
 DOTA2_OUTPUT_VERSION = _env("DOTA2_OUTPUT_VERSION", "v1").strip().lower() or "v1"
 DOTA2_V2_MAX_MATCHES_PER_RUN = max(1, int(_env("DOTA2_V2_MAX_MATCHES_PER_RUN", "1")))
 DOTA2_V2_STARTUP_BACKFILL_MATCHES = max(0, int(_env("DOTA2_V2_STARTUP_BACKFILL_MATCHES", "0")))
+DOTA2_V2_DEBUG_DEFAULT = _env("DOTA2_V2_DEBUG", "false").lower() == "true"
 
 HERO_CACHE_FILE = Path(_env("DOTA2_HERO_CACHE_FILE", str(DATA_DIR / "heroes.json")))
 ITEM_CACHE_FILE = Path(_env("DOTA2_ITEM_CACHE_FILE", str(DATA_DIR / "items.json")))
@@ -103,8 +114,51 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def is_v2_debug_enabled() -> bool:
+    return get_bool_flag("dota2_v2_debug", default=DOTA2_V2_DEBUG_DEFAULT)
+
+
+def set_v2_debug_enabled(enabled: bool) -> bool:
+    return set_bool_flag("dota2_v2_debug", bool(enabled))
+
+
+def _log_v2_debug(stage: str, *, match_id: Any, group_id: int | None, payload: Any) -> None:
+    if not is_v2_debug_enabled():
+        return
+    try:
+        body = json.dumps(payload, ensure_ascii=False, indent=2)
+    except Exception:
+        body = str(payload)
+    logger.info(
+        "Dota2 v2 debug stage={} match_id={} group_id={}\n{}",
+        stage,
+        match_id,
+        group_id if group_id is not None else "none",
+        body,
+    )
+
+
 def _notify_group_ids_for_account(account_id: str) -> list[int]:
     return group_ids_for_account(account_id, default_group_id=DOTA2_NOTIFY_GROUP_ID)
+
+
+async def _persist_match_detail(match: dict[str, Any], *, target_steam_ids: set[str] | None = None) -> bool:
+    target_ids = target_steam_ids or set(_watched_account_ids())
+    try:
+        await asyncio.to_thread(
+            save_raw_match_and_analysis,
+            match,
+            target_steam_ids=target_ids,
+        )
+        return True
+    except Exception:
+        logger.exception(
+            "Dota2 persist failed: stage=persist_match_detail match_id={} match_seq_num={} target_steam_ids={}",
+            match.get("match_id"),
+            match.get("match_seq_num"),
+            sorted(target_ids),
+        )
+        return False
 
 
 async def _send_group_texts(group_ids: list[int], text: str) -> None:
@@ -241,29 +295,71 @@ async def _fetch_recent_matches(account_id: str, matches_requested: int) -> list
         account_id=account_id,
         matches_requested=matches_requested,
     )
-    data = await _fetch_json(url)
+    try:
+        data = await _fetch_json(url)
+    except Exception:
+        logger.exception(
+            "Dota2 collect failed: stage=fetch_recent_matches_failed account_id={} matches_requested={}",
+            account_id,
+            matches_requested,
+        )
+        raise
     result = data.get("result", {})
     matches = result.get("matches")
     if not isinstance(matches, list):
+        logger.warning(
+            "Dota2 collect failed: stage=fetch_recent_matches_invalid_payload account_id={} matches_requested={} reason=matches_not_list",
+            account_id,
+            matches_requested,
+        )
         return []
     return matches
 
 
-async def _fetch_sequence_match(match_seq_num: int) -> dict[str, Any] | None:
+async def _fetch_sequence_match(
+    match_seq_num: int,
+    *,
+    target_steam_ids: set[str] | None = None,
+    persist_required: bool = False,
+) -> dict[str, Any] | None:
     url = _build_steam_url(
         "IDOTA2Match_570",
         "GetMatchHistoryBySequenceNum",
         start_at_match_seq_num=match_seq_num,
         matches_requested=DOTA2_SEQUENCE_BATCH_SIZE,
     )
-    data = await _fetch_json(url)
+    try:
+        data = await _fetch_json(url)
+    except Exception:
+        logger.exception(
+            "Dota2 collect failed: stage=fetch_sequence_failed match_seq_num={} target_steam_ids={}",
+            match_seq_num,
+            sorted(target_steam_ids or set()),
+        )
+        raise
     result = data.get("result", {})
     matches = result.get("matches")
     if not isinstance(matches, list):
+        logger.warning(
+            "Dota2 collect failed: stage=fetch_sequence_invalid_payload match_seq_num={} reason=matches_not_list",
+            match_seq_num,
+        )
         return None
     for match in matches:
         if match.get("match_seq_num") == match_seq_num:
+            persisted = await _persist_match_detail(match, target_steam_ids=target_steam_ids)
+            if persist_required and not persisted:
+                logger.warning(
+                    "Dota2 collect failed: stage=fetch_sequence_persist_failed match_id={} match_seq_num={} reason=persist_required_failed",
+                    match.get("match_id"),
+                    match_seq_num,
+                )
+                return None
             return match
+    logger.warning(
+        "Dota2 collect failed: stage=fetch_sequence_not_found match_seq_num={} reason=target_sequence_not_found",
+        match_seq_num,
+    )
     return None
 
 
@@ -366,6 +462,209 @@ def list_watched_accounts() -> list[dict[str, str]]:
 
 def resolve_watched_account(query: str) -> str | None:
     return _config_resolve_watched_account(query)
+
+
+async def collect_recent_matches(account_id: str, matches_requested: int) -> dict[str, int]:
+    requested = max(1, min(100, int(matches_requested)))
+    summaries = {
+        "requested": requested,
+        "scanned": 0,
+        "fetched": 0,
+        "skipped": 0,
+        "failed": 0,
+    }
+    logger.info(
+        "Dota2 collect start: account_id={} requested={}",
+        account_id,
+        requested,
+    )
+    try:
+        recent_matches = await _fetch_recent_matches(account_id, requested)
+    except Exception:
+        summaries["failed"] = requested
+        logger.exception(
+            "Dota2 collect failed: stage=fetch_recent_matches account_id={} requested={}",
+            account_id,
+            requested,
+        )
+        return summaries
+    target_ids = {str(account_id)}
+    for history_match in recent_matches[:requested]:
+        summaries["scanned"] += 1
+        match_id = history_match.get("match_id")
+        match_seq_num = history_match.get("match_seq_num")
+        if not isinstance(match_id, int) or not isinstance(match_seq_num, int):
+            summaries["failed"] += 1
+            logger.warning(
+                "Dota2 collect failed: stage=invalid_history_match account_id={} match_id={} match_seq_num={} reason=missing_match_id_or_seq",
+                account_id,
+                match_id,
+                match_seq_num,
+            )
+            continue
+        if has_raw_match(match_id):
+            summaries["skipped"] += 1
+            logger.info(
+                "Dota2 collect skip: stage=skip_existing_raw_match account_id={} match_id={} match_seq_num={} reason=raw_match_exists",
+                account_id,
+                match_id,
+                match_seq_num,
+            )
+            continue
+        try:
+            detailed_match = await _fetch_sequence_match(
+                match_seq_num,
+                target_steam_ids=target_ids,
+                persist_required=True,
+            )
+        except Exception:
+            summaries["failed"] += 1
+            logger.exception(
+                "Dota2 collect failed: stage=fetch_sequence_match account_id={} match_id={} match_seq_num={}",
+                account_id,
+                match_id,
+                match_seq_num,
+            )
+            continue
+        if detailed_match is None:
+            summaries["failed"] += 1
+            logger.warning(
+                "Dota2 collect failed: stage=fetch_sequence_match_empty account_id={} match_id={} match_seq_num={} reason=no_detailed_match",
+                account_id,
+                match_id,
+                match_seq_num,
+            )
+            continue
+        summaries["fetched"] += 1
+    logger.info(
+        "Dota2 collect done: account_id={} requested={} scanned={} fetched={} skipped={} failed={}",
+        account_id,
+        summaries["requested"],
+        summaries["scanned"],
+        summaries["fetched"],
+        summaries["skipped"],
+        summaries["failed"],
+    )
+    return summaries
+
+
+async def collect_recent_matches_for_all(matches_requested: int = 50) -> dict[str, Any]:
+    requested = max(1, min(100, int(matches_requested)))
+    watched_accounts = list_watched_accounts()
+    overall = {
+        "accounts": len(watched_accounts),
+        "requested_per_account": requested,
+        "requested_total": requested * len(watched_accounts),
+        "scanned": 0,
+        "fetched": 0,
+        "skipped": 0,
+        "failed": 0,
+        "per_account": [],
+    }
+    for item in watched_accounts:
+        account_id = str(item["account_id"])
+        summary = await collect_recent_matches(account_id, requested)
+        overall["scanned"] += int(summary["scanned"])
+        overall["fetched"] += int(summary["fetched"])
+        overall["skipped"] += int(summary["skipped"])
+        overall["failed"] += int(summary["failed"])
+        overall["per_account"].append(
+            {
+                "account_id": account_id,
+                "display_name": str(item["display_name"]),
+                **summary,
+            }
+        )
+    return overall
+
+
+def rebuild_recent_match_analysis(account_id: str | None = None) -> dict[str, int]:
+    target_ids = {account_id} if account_id else set(_watched_account_ids())
+    logger.info(
+        "Dota2 rebuild analysis start: account_id={} target_steam_ids={}",
+        account_id or "all",
+        sorted(target_ids),
+    )
+    summaries = rebuild_player_match_analysis_from_raw_matches(target_steam_ids=target_ids)
+    logger.info(
+        "Dota2 rebuild analysis done: account_id={} scanned_matches={} inserted_rows={} skipped_existing_rows={} failed_matches={} failed_players={}",
+        account_id or "all",
+        summaries["scanned_matches"],
+        summaries["inserted_rows"],
+        summaries["skipped_existing_rows"],
+        summaries["failed_matches"],
+        summaries["failed_players"],
+    )
+    return summaries
+
+
+def build_recent_match_analysis_text(account_id: str, limit: int = 50) -> str:
+    summary = get_recent_account_analysis(account_id, limit=limit)
+    sample_size = int(summary.get("sample_size") or 0)
+    if sample_size <= 0:
+        return f"本地还没有 {account_id} 的比赛分析数据，请先使用 /dota_collect 采集最近比赛。"
+
+    display_name = _display_name_for_account(account_id)
+    most_played_hero_id = summary.get("most_played_hero_id")
+    highest_kills_hero_id = summary.get("highest_kills_hero_id")
+    highest_deaths_hero_id = summary.get("highest_deaths_hero_id")
+    most_played_hero_name = _resolve_hero_name(most_played_hero_id) if most_played_hero_id else "未知英雄"
+    highest_kills_hero_name = _resolve_hero_name(highest_kills_hero_id) if highest_kills_hero_id else "未知英雄"
+    highest_deaths_hero_name = _resolve_hero_name(highest_deaths_hero_id) if highest_deaths_hero_id else "未知英雄"
+    win_count = int(summary.get("win_count") or 0)
+    loss_count = int(summary.get("loss_count") or 0)
+    win_rate = float(summary.get("win_rate") or 0.0) * 100
+    return "\n".join(
+        [
+            f"Dota2 最近50场分析：{display_name}",
+            f"样本数：{sample_size} 场，胜率：{win_rate:.2f}%（{win_count}胜{loss_count}负）",
+            f"使用最多英雄：{most_played_hero_name}（{int(summary.get('most_played_hero_count') or 0)}场）",
+            f"最高击杀：{int(summary.get('highest_kills') or 0)}杀，英雄：{highest_kills_hero_name}，Match ID：{summary.get('highest_kills_match_id') or '未知'}",
+            f"最高死亡：{int(summary.get('highest_deaths') or 0)}死，英雄：{highest_deaths_hero_name}，Match ID：{summary.get('highest_deaths_match_id') or '未知'}",
+        ]
+    )
+
+
+async def build_player_profile_text(account_id: str, *, group_id: int, limit: int = 50) -> str:
+    features = build_player_profile_features(account_id, limit=limit)
+    if int(features.get("sample_size") or 0) <= 0:
+        return f"本地还没有 {account_id} 的比赛分析数据，请先使用 /dota_collect 采集最近比赛。"
+    display_name = _display_name_for_account(account_id)
+    prompt = (
+        "你是一个专业的 Dota2 复盘教练。\n"
+        "你会根据玩家最近比赛的结构化特征，提炼打法风格，并给出有逻辑的改进建议。\n"
+        "请只基于给出的数据下结论，不要编造不存在的比赛细节。\n"
+        "输出必须包含：打法概括、优势点、主要问题、最优先的3条改进措施。\n"
+        "如果有必要，可以补一段更适合他当前英雄池的训练思路。\n"
+        "结论要具体，避免空泛鼓励。\n"
+        "只输出适合 QQ 聊天展示的纯文本，不要使用 Markdown，不要代码块。\n"
+        "严格按下面格式输出，并保留这些换行和空行：\n"
+        f"Dota2 最近50场打法分析：{display_name}\n\n"
+        "打法概括：用 2 到 3 句话。\n\n"
+        "优势点：\n"
+        "1. ...\n"
+        "2. ...\n\n"
+        "主要问题：\n"
+        "1. ...\n"
+        "2. ...\n"
+        "3. ...\n\n"
+        "改进建议：\n"
+        "1. ...\n"
+        "2. ...\n"
+        "3. ...\n\n"
+        "如果没有必要，不要额外增加别的段落。\n"
+        "不要输出思考过程，只保留回答正文。\n\n"
+        f"玩家：{display_name}\n"
+        f"最近比赛结构化特征：\n{json.dumps(features, ensure_ascii=False, indent=2)}"
+    )
+    return await ask_main(
+        prompt,
+        channel=f"qq-g{group_id}-dota-profile-{account_id}-{int(time.time())}",
+    )
+
+
+async def build_hero_guide_text(hero_query: str, *, group_id: int) -> str:
+    return await _build_hero_guide_text(hero_query, group_id=group_id)
 
 
 def _resolve_hero_name(hero_id: Any) -> str:
@@ -530,7 +829,12 @@ def _build_v2_fallback_text(payload: dict[str, Any]) -> str:
     return f"Match {payload.get('match_id')} " + "；".join(parts)
 
 
-async def _build_v2_group_message(match: dict[str, Any], *, target_account_ids: set[str] | None = None) -> str:
+async def _build_v2_group_message(
+    match: dict[str, Any],
+    *,
+    target_account_ids: set[str] | None = None,
+    group_id: int | None = None,
+) -> str:
     payload = _build_v2_payload(match)
     if target_account_ids is not None:
         target_ids = {str(account_id) for account_id in target_account_ids}
@@ -549,8 +853,20 @@ async def _build_v2_group_message(match: dict[str, Any], *, target_account_ids: 
         ]
         if not payload["tracked_players"]:
             return f"Match {payload.get('match_id')} 有新比赛，但没找到指定监听玩家。"
+    _log_v2_debug(
+        "normalized_payload",
+        match_id=payload.get("match_id"),
+        group_id=group_id,
+        payload=payload,
+    )
     try:
         answer = await _ask_openclaw(_build_v2_prompt(payload))
+        _log_v2_debug(
+            "llm_response",
+            match_id=payload.get("match_id"),
+            group_id=group_id,
+            payload={"text": answer},
+        )
         return answer
     except Exception:
         logger.exception("OpenClaw v2 commentary failed for match %s", payload.get("match_id"))
@@ -569,8 +885,14 @@ async def build_latest_match_push_text(account_id: str) -> str:
     detailed_match = await _fetch_sequence_match(match_seq_num)
     if not detailed_match:
         raise RuntimeError(f"账号 {account_id} 的最近比赛详情暂时拉取失败。")
+    _log_v2_debug(
+        "raw_match",
+        match_id=detailed_match.get("match_id"),
+        group_id=None,
+        payload=detailed_match,
+    )
     if DOTA2_OUTPUT_VERSION == "v2":
-        return await _build_v2_group_message(detailed_match, target_account_ids={account_id})
+        return await _build_v2_group_message(detailed_match, target_account_ids={account_id}, group_id=None)
     message = await _build_match_message(account_id, history_match, detailed_match)
     if not message:
         raise RuntimeError(f"账号 {account_id} 的最近比赛里没找到对应玩家数据。")
@@ -609,14 +931,14 @@ def _merge_recent_queue(
         match_id = match.get("match_id")
         if isinstance(match_id, int):
             recent_map[match_id] = match
-    latest_pending_ids: list[int] = []
-    seen = set(known_ids)
+    merged_pending_ids = [match_id for match_id in pending_ids if match_id in recent_map]
+    seen = set(known_ids) | set(merged_pending_ids)
     for match in latest_matches:
         match_id = match.get("match_id")
         if isinstance(match_id, int) and match_id not in seen:
-            latest_pending_ids.append(match_id)
+            merged_pending_ids.append(match_id)
             seen.add(match_id)
-    return known_ids, latest_pending_ids, recent_map
+    return known_ids, merged_pending_ids, recent_map
 
 
 async def _bootstrap_account_state(state: dict[str, Any], account_id: str) -> None:
@@ -692,6 +1014,117 @@ async def _check_account_matches_v1(state: dict[str, Any], account_id: str) -> l
     return summaries
 
 
+def _mark_v2_match_processed(account_state: dict[str, Any], known_ids: list[int], pending_ids: list[int], match_id: int) -> None:
+    if match_id in pending_ids:
+        pending_ids.remove(match_id)
+    if match_id not in known_ids:
+        known_ids.append(match_id)
+    account_state["last_pushed_match_id"] = match_id
+    account_state["known_match_ids"] = known_ids[-(DOTA2_HISTORY_WINDOW * 3) :]
+    account_state["pending_match_ids"] = pending_ids
+
+
+async def _collect_account_matches_v2(
+    state: dict[str, Any],
+    account_id: str,
+) -> list[dict[str, Any]]:
+    account_state = state["accounts"].get(account_id)
+    if not isinstance(account_state, dict):
+        await _bootstrap_account_state(state, account_id)
+        return []
+
+    recent_matches = await _fetch_recent_matches(account_id, DOTA2_HISTORY_WINDOW)
+    if not recent_matches:
+        return []
+
+    known_ids, pending_ids, recent_map = _merge_recent_queue(account_state, recent_matches)
+    if not pending_ids:
+        if recent_matches and isinstance(recent_matches[0].get("match_id"), int):
+            account_state["last_pushed_match_id"] = recent_matches[0]["match_id"]
+        account_state["known_match_ids"] = known_ids[-(DOTA2_HISTORY_WINDOW * 3) :]
+        account_state["pending_match_ids"] = []
+        return []
+
+    collected: list[dict[str, Any]] = []
+    for match_id in pending_ids[:DOTA2_V2_MAX_MATCHES_PER_RUN]:
+        history_match = recent_map.get(match_id)
+        if history_match is None:
+            continue
+        match_seq_num = history_match.get("match_seq_num")
+        if not isinstance(match_seq_num, int):
+            _mark_v2_match_processed(account_state, known_ids, pending_ids, match_id)
+            continue
+        collected.append(
+            {
+                "account_id": account_id,
+                "match_id": match_id,
+                "match_seq_num": match_seq_num,
+                "group_ids": _notify_group_ids_for_account(account_id),
+            }
+        )
+
+    account_state["known_match_ids"] = known_ids[-(DOTA2_HISTORY_WINDOW * 3) :]
+    account_state["pending_match_ids"] = pending_ids
+    return collected
+
+
+async def _push_v2_match_events_once(state: dict[str, Any], watched_accounts: list[str]) -> list[str]:
+    events_by_match: dict[int, dict[str, Any]] = {}
+    for account_id in watched_accounts:
+        try:
+            for event in await _collect_account_matches_v2(state, account_id):
+                match_id = int(event["match_id"])
+                bucket = events_by_match.setdefault(
+                    match_id,
+                    {
+                        "match_seq_num": int(event["match_seq_num"]),
+                        "accounts_by_group": {},
+                        "account_ids": set(),
+                    },
+                )
+                bucket["account_ids"].add(str(event["account_id"]))
+                accounts_by_group = bucket["accounts_by_group"]
+                for group_id in event["group_ids"]:
+                    accounts_by_group.setdefault(int(group_id), set()).add(str(event["account_id"]))
+        except Exception:
+            logger.exception("Dota2 check failed for account %s", account_id)
+
+    summaries: list[str] = []
+    for match_id in sorted(events_by_match):
+        event = events_by_match[match_id]
+        match_seq_num = event["match_seq_num"]
+        detailed_match = await _fetch_sequence_match(match_seq_num)
+        if not detailed_match:
+            logger.warning("No sequence match found for aggregated match_id=%s", match_id)
+            continue
+
+        for group_id, target_account_ids in sorted(event["accounts_by_group"].items()):
+            _log_v2_debug(
+                "raw_match",
+                match_id=match_id,
+                group_id=group_id,
+                payload=detailed_match,
+            )
+            message = await _build_v2_group_message(
+                detailed_match,
+                target_account_ids=target_account_ids,
+                group_id=group_id,
+            )
+            await send_group_text(group_id, message)
+            account_names = ",".join(_display_name_for_account(account_id) for account_id in sorted(target_account_ids))
+            summaries.append(f"v2 group={group_id} match_id={match_id} accounts={account_names}")
+
+        for account_id in sorted(event["account_ids"]):
+            account_state = state["accounts"].get(account_id)
+            if not isinstance(account_state, dict):
+                continue
+            known_ids = _normalize_known_ids(account_state)
+            pending_ids = _normalize_pending_ids(account_state)
+            _mark_v2_match_processed(account_state, known_ids, pending_ids, match_id)
+
+    return summaries
+
+
 async def _check_account_matches_v2(state: dict[str, Any], account_id: str) -> list[str]:
     account_state = state["accounts"].get(account_id)
     if not isinstance(account_state, dict):
@@ -727,7 +1160,13 @@ async def _check_account_matches_v2(state: dict[str, Any], account_id: str) -> l
         if not detailed_match:
             logger.warning("No sequence match found for account=%s match_id=%s", account_id, match_id)
             continue
-        message = await _build_v2_group_message(detailed_match)
+        _log_v2_debug(
+            "raw_match",
+            match_id=match_id,
+            group_id=None,
+            payload=detailed_match,
+        )
+        message = await _build_v2_group_message(detailed_match, group_id=None)
         await _send_group_texts(_notify_group_ids_for_account(account_id), message)
         pending_ids.remove(match_id)
         known_ids.append(match_id)
@@ -755,15 +1194,15 @@ async def run_dota2_check_once(force_refresh: bool = False) -> list[str]:
         state.setdefault("accounts", {})
         state.setdefault("meta", {})
 
-        summaries: list[str] = []
-        for account_id in watched_accounts:
-            try:
-                if DOTA2_OUTPUT_VERSION == "v2":
-                    summaries.extend(await _check_account_matches_v2(state, account_id))
-                else:
+        if DOTA2_OUTPUT_VERSION == "v2":
+            summaries = await _push_v2_match_events_once(state, watched_accounts)
+        else:
+            summaries: list[str] = []
+            for account_id in watched_accounts:
+                try:
                     summaries.extend(await _check_account_matches_v1(state, account_id))
-            except Exception:
-                logger.exception("Dota2 check failed for account %s", account_id)
+                except Exception:
+                    logger.exception("Dota2 check failed for account %s", account_id)
 
         _save_state(state)
         return summaries
@@ -786,19 +1225,43 @@ async def push_recent_matches_with_openclaw(count: int) -> list[str]:
     if not await _wait_for_bot():
         raise RuntimeError("Bot did not connect before v2 backfill.")
 
-    summaries: list[str] = []
+    events_by_match: dict[int, dict[str, Any]] = {}
     for account_id in _watched_account_ids():
         recent_matches = await _fetch_recent_matches(account_id, count)
         for history_match in reversed(recent_matches[:count]):
+            match_id = history_match.get("match_id")
             match_seq_num = history_match.get("match_seq_num")
-            if not isinstance(match_seq_num, int):
+            if not isinstance(match_id, int) or not isinstance(match_seq_num, int):
                 continue
-            detailed_match = await _fetch_sequence_match(match_seq_num)
-            if not detailed_match:
-                continue
-            message = await _build_v2_group_message(detailed_match)
-            await _send_group_texts(_notify_group_ids_for_account(account_id), message)
-            summaries.append(f"v2-backfill account={account_id} match_id={history_match.get('match_id')}")
+            bucket = events_by_match.setdefault(
+                match_id,
+                {
+                    "match_seq_num": match_seq_num,
+                    "accounts_by_group": {},
+                },
+            )
+            for group_id in _notify_group_ids_for_account(account_id):
+                bucket["accounts_by_group"].setdefault(int(group_id), set()).add(str(account_id))
+
+    summaries: list[str] = []
+    for match_id in sorted(events_by_match):
+        event = events_by_match[match_id]
+        detailed_match = await _fetch_sequence_match(event["match_seq_num"])
+        if not detailed_match:
+            continue
+        for group_id, target_account_ids in sorted(event["accounts_by_group"].items()):
+            _log_v2_debug(
+                "raw_match",
+                match_id=match_id,
+                group_id=group_id,
+                payload=detailed_match,
+            )
+            message = await _build_v2_group_message(
+                detailed_match,
+                target_account_ids=target_account_ids,
+                group_id=group_id,
+            )
+            await send_group_text(group_id, message)
+            account_names = ",".join(_display_name_for_account(account_id) for account_id in sorted(target_account_ids))
+            summaries.append(f"v2-backfill group={group_id} match_id={match_id} accounts={account_names}")
     return summaries
-
-

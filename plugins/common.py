@@ -34,6 +34,42 @@ def collapse_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def format_qq_chat_text(text: str) -> str:
+    if not text.strip():
+        return ""
+
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    normalized = re.sub(r"```[a-zA-Z0-9_-]*\n?", "", normalized)
+    normalized = normalized.replace("```", "")
+
+    lines: list[str] = []
+    for raw_line in normalized.splitlines():
+        line = raw_line.strip()
+        if not line:
+            if lines and lines[-1] != "":
+                lines.append("")
+            continue
+
+        line = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r"\1：\2", line)
+        line = re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", r"[图片] \1 \2", line)
+        line = re.sub(r"^\s{0,3}#{1,6}\s*", "", line)
+        line = re.sub(r"^\s*>\s*", "", line)
+        line = re.sub(r"^\s*[-*+]\s+\[\s\]\s*", "[未完成] ", line)
+        line = re.sub(r"^\s*[-*+]\s+\[[xX]\]\s*", "[已完成] ", line)
+        line = re.sub(r"^\s*[-*+]\s+", "• ", line)
+        line = re.sub(r"^(\d+)\)\s+", r"\1. ", line)
+        line = line.replace("`", "")
+        line = re.sub(r"\*\*(.+?)\*\*", r"\1", line)
+        line = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"\1", line)
+        line = re.sub(r"[ \t]+", " ", line).strip()
+        if line:
+            lines.append(line)
+
+    while lines and lines[-1] == "":
+        lines.pop()
+    return "\n".join(lines)
+
+
 def strip_reasoning_text(text: str) -> str:
     cleaned = text
     cleaned = re.sub(r"<thinking>.*?</thinking>", " ", cleaned, flags=re.S | re.I)
@@ -54,7 +90,18 @@ def strip_reasoning_text(text: str) -> str:
         flags=re.M,
     )
     cleaned = re.sub(r"```(?:thinking|reasoning)[\s\S]*?```", " ", cleaned, flags=re.I)
-    return collapse_text(cleaned)
+    cleaned = cleaned.replace("\r\n", "\n").replace("\r", "\n")
+    lines: list[str] = []
+    for raw_line in cleaned.splitlines():
+        line = re.sub(r"[ \t]+", " ", raw_line).strip()
+        if not line:
+            if lines and lines[-1] != "":
+                lines.append("")
+            continue
+        lines.append(line)
+    while lines and lines[-1] == "":
+        lines.pop()
+    return "\n".join(lines).strip()
 
 
 def extract_openclaw_text(data: dict[str, Any]) -> str:
@@ -104,14 +151,14 @@ async def send_private_text(user_id: int, text: str) -> dict[str, Any]:
     bot = pick_bot()
     if bot is None:
         raise RuntimeError("No connected OneBot V11 bot is available.")
-    return await bot.send_private_msg(user_id=user_id, message=text)
+    return await bot.send_private_msg(user_id=user_id, message=format_qq_chat_text(text))
 
 
 async def send_group_text(group_id: int, text: str) -> dict[str, Any]:
     bot = pick_bot()
     if bot is None:
         raise RuntimeError("No connected OneBot V11 bot is available.")
-    return await bot.send_group_msg(group_id=group_id, message=text)
+    return await bot.send_group_msg(group_id=group_id, message=format_qq_chat_text(text))
 
 
 class OpenClawClient:

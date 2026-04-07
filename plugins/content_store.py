@@ -3,14 +3,20 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from .common import env, load_env_file
+from .common import env, format_qq_chat_text, load_env_file
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 ENV_FILE = BASE_DIR / ".env"
 ENV_VALUES = load_env_file(ENV_FILE)
 WORKSPACE_ROOT = Path(env(ENV_VALUES, "QQ_BOT_WORKSPACE", "/home/futunan/data/study_code/game_demo")).resolve()
 TODOLIST_PATH = Path(env(ENV_VALUES, "QQ_BOT_TODOLIST_PATH", str(WORKSPACE_ROOT / "todolist.md"))).resolve()
-DESCRIPTION_PATH = Path(env(ENV_VALUES, "QQ_BOT_DESCRIPTION_PATH", env(ENV_VALUES, "QQ_BOT_VERSION_PATH", str(WORKSPACE_ROOT / "description.md")))).resolve()
+DESCRIPTION_PATH = Path(
+    env(
+        ENV_VALUES,
+        "QQ_BOT_DESCRIPTION_PATH",
+        env(ENV_VALUES, "QQ_BOT_VERSION_PATH", str(WORKSPACE_ROOT / "description.md")),
+    )
+).resolve()
 
 
 def _assert_allowed_file(path: Path, *, writable: bool) -> None:
@@ -60,11 +66,16 @@ def _build_todolist_content(items: list[str]) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
+def markdown_to_chat_text(content: str) -> str:
+    return format_qq_chat_text(content)
+
+
 def todo_display_text(content: str) -> str:
-    lines = content.splitlines()
-    if lines and lines[0].strip() == "# Todo List":
-        lines = lines[1:]
-    display = "\n".join(lines).strip()
+    display = markdown_to_chat_text(content)
+    if display.startswith("Todo List\n"):
+        display = display[len("Todo List\n") :].strip()
+    elif display == "Todo List":
+        display = ""
     return display or "当前还没有待办功能。"
 
 
@@ -77,7 +88,7 @@ def read_todo_display() -> str:
 
 
 def read_description() -> str:
-    description = _read_controlled_file(DESCRIPTION_PATH).strip()
+    description = markdown_to_chat_text(_read_controlled_file(DESCRIPTION_PATH)).strip()
     return description or "当前还没有维护版本说明文件。"
 
 

@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any
 
-from .common import collapse_text, env, load_env_file
-from .content_store import read_description
-from .llm_gateway import ask_main, ask_router
+from .common import env, load_env_file
+from .group_chat_store import get_recent_group_context
+from .group_memory_store import retrieve_group_memories
+from .llm_gateway import ask_main
+from .openclaw_group_memory import ensure_group_openclaw_setup, group_chat_agent_id
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 ENV_FILE = BASE_DIR / ".env"
@@ -18,48 +21,19 @@ ENV_VALUES = load_env_file(ENV_FILE)
 TAVILY_API_KEY = env(ENV_VALUES, "TAVILY_API_KEY", "")
 TAVILY_API_URL = env(ENV_VALUES, "TAVILY_API_URL", "https://api.tavily.com/search")
 TAVILY_MAX_RESULTS = max(1, int(env(ENV_VALUES, "TAVILY_MAX_RESULTS", "5") or "5"))
-
-CLASS_LABELS = {
-    "version_query",
-    "bot_abuse",
-    "web_answerable",
-    "smalltalk",
-}
+GROUP_CHAT_CONTEXT_LIMIT = max(
+    1, int(env(ENV_VALUES, "QQ_GROUP_CHAT_AGENT_CONTEXT_LIMIT", "20") or "20")
+)
 
 
 def message_channel(group_id: int, message_id: int, stage: str) -> str:
-    safe_stage = "".join(ch if ch.isalnum() or ch == "-" else "-" for ch in stage.lower()).strip("-") or "msg"
-    return f"qq-g{group_id}-m{message_id}-{safe_stage}"
-
-
-async def _classify_message(content: str, *, channel: str) -> str:
-    prompt = (
-        "你是一个严格的消息分类器。\n"
-        "请把下面这条发给 QQ 机器人的群消息，严格分类为且仅输出以下四个标签之一：\n"
-        "version_query\nbot_abuse\nweb_answerable\nsmalltalk\n\n"
-        "分类规则：\n"
-        "1. 只要用户是在问机器人当前已经有什么功能、支持什么能力、版本特性、现在会做什么，一律归类为 version_query。\n"
-        "2. 骂机器人、嘲讽机器人、攻击机器人本身，归类为 bot_abuse。\n"
-        "3. 明显需要联网查实时信息、资料、天气、新闻、官网信息的问题，归类为 web_answerable。\n"
-        "4. 其他普通闲聊归类为 smalltalk。\n\n"
-        "例子：\n"
-        "你有什么功能 -> version_query\n"
-        "你现在支持哪些功能 -> version_query\n"
-        "北京今天天气怎么样 -> web_answerable\n"
-        "你可真蠢 -> bot_abuse\n"
-        "你好啊 -> smalltalk\n\n"
-        "只输出标签本身，不要解释。\n\n"
-        f"消息：{content}"
+    safe_stage = (
+        "".join(ch if ch.isalnum() or ch == "-" else "-" for ch in stage.lower()).strip(
+            "-"
+        )
+        or "msg"
     )
-    raw = collapse_text(await ask_router(prompt, channel=channel))
-    for label in CLASS_LABELS:
-        if raw == label:
-            return label
-    lowered = raw.lower()
-    for label in CLASS_LABELS:
-        if label in lowered:
-            return label
-    return "smalltalk"
+    return f"qq-g{group_id}-m{message_id}-{safe_stage}"
 
 
 def _build_tavily_payload(query: str) -> dict[str, Any]:
@@ -75,7 +49,10 @@ def _build_tavily_payload(query: str) -> dict[str, Any]:
     lowered = query.lower()
     if "dota" in lowered or "刀塔" in query:
         payload["include_domains"] = ["dota2.com", "www.dota2.com"]
-        if any(token in query for token in ("装备", "版本", "补丁", "更新", "item", "patch", "meta")):
+        if any(
+            token in query
+            for token in ("装备", "版本", "补丁", "更新", "item", "patch", "meta")
+        ):
             payload["query"] = f"Dota 2 latest patch official patch notes {query}"
     return payload
 
@@ -105,86 +82,128 @@ async def _tavily_search(query: str) -> dict[str, Any]:
     return await asyncio.to_thread(_tavily_search_sync, query)
 
 
-def _build_tavily_context(search_data: dict[str, Any]) -> str:
-    answer = str(search_data.get("answer", "")).strip()
+def _format_news_text(text: str) -> str:
+    compact = re.sub(r"[ \t]+", " ", text).strip()
+    compact = re.sub(r"\s*(来源：)", r"\n\1", compact)
+    compact = re.sub(r"\s*([1-9]\d*\.)\s*", r"\n\1 ", compact)
+    compact = compact.lstrip("\n")
+    lines = [line.strip() for line in compact.splitlines() if line.strip()]
+    return "\n".join(lines).strip()
+
+
+def _build_news_text_from_search(
+    search_data: dict[str, Any], *, keyword: str = ""
+) -> str:
     raw_results = search_data.get("results", [])
+    if not isinstance(raw_results, list):
+        raw_results = []
+    blocks: list[str] = []
+    links: list[str] = []
+    for item in raw_results:
+        if not isinstance(item, dict):
+            continue
+        title = re.sub(r"\\s+", " ", str(item.get("title", "")).strip())
+        snippet = re.sub(
+            r"\\s+", " ", str(item.get("content") or item.get("snippet") or "").strip()
+        )
+        url = str(item.get("url", "")).strip()
+        if not title and not snippet:
+            continue
+        summary = snippet or title
+        blocks.append(f"{title}：{summary}" if title and snippet else (title or summary))
+        if url and url not in links:
+            links.append(url)
+        if len(blocks) >= 5:
+            break
+    if not blocks:
+        answer = re.sub(r"\\s+", " ", str(search_data.get("answer", "")).strip())
+        if answer:
+            blocks.append(answer)
+    if not blocks:
+        return ""
+    headline = f"今日{keyword.strip()}新闻" if keyword.strip() else "今日新闻"
+    lines = [headline]
+    for index, block in enumerate(blocks[:5], start=1):
+        lines.append(f"{index}. {block}")
+    if links:
+        lines.append(f"来源：{' '.join(links[:3])}")
+    return _format_news_text("\n".join(lines))
+
+
+def _build_group_context_text(group_id: int) -> str:
+    records = get_recent_group_context(group_id, max_items=GROUP_CHAT_CONTEXT_LIMIT)
+    if not records:
+        return "最近两小时群里还没有可用上下文。"
     lines: list[str] = []
-    if answer:
-        lines.append(f"搜索摘要：{answer}")
-    if isinstance(raw_results, list):
-        for index, item in enumerate(raw_results[:TAVILY_MAX_RESULTS], start=1):
-            if not isinstance(item, dict):
-                continue
-            title = str(item.get("title", "")).strip()
-            url = str(item.get("url", "")).strip()
-            snippet = str(item.get("content") or item.get("snippet") or "").strip()
-            block = [f"[结果{index}]"]
-            if title:
-                block.append(f"标题：{title}")
-            if url:
-                block.append(f"链接：{url}")
-            if snippet:
-                block.append(f"摘要：{snippet}")
-            lines.append("\n".join(block))
-    return "\n\n".join(lines).strip()
+    for item in records:
+        timestamp = float(item["timestamp"])
+        sender_name = str(item["sender_name"])
+        text = str(item["text"])
+        time_text = time.strftime("%H:%M", time.localtime(timestamp))
+        lines.append(f"{time_text} {sender_name}: {text}")
+    return "\n".join(lines)
 
 
-async def _handle_version_query(content: str, *, channel: str) -> str:
-    return read_description()
+def _build_structured_memory_text(group_id: int, content: str) -> str:
+    matches = retrieve_group_memories(group_id, content, limit=3)
+    if not matches:
+        return "（无命中的长期记忆）"
+    lines = [f"- {item['content']}" for item in matches if str(item.get("content", "")).strip()]
+    return "\n".join(lines).strip() or "（无命中的长期记忆）"
 
 
-async def _handle_bot_abuse(content: str, *, channel: str) -> str:
-    prompt = (
-        "你是一个 QQ 机器人。用户正在骂你或批评你。\n"
-        "请直接输出一句最终回怼原文。\n"
-        "要求：简短、阴阳、允许一点刻薄和嘲讽，但不要现实侮辱、不要仇恨、不要长篇输出。\n"
-        "可以带 1 个恰到好处的 emoji。\n"
-        "不要解释，不要复述用户消息，不要分析。\n\n"
-        f"用户消息：{content}"
+def _build_group_chat_prompt(content: str, *, group_id: int) -> str:
+    return (
+        "你是一个真实 QQ 群里的机器人，这是该群唯一的自然语言 agent。\n"
+        "你的任务是直接理解用户意图，并输出最终回复；不要先做显式分类，也不要输出你分到了什么路由。\n"
+        "优先原则：\n"
+        "1. 简单闲聊、打招呼、接梗、吐槽，直接回复，不要调用任何工具。\n"
+        "2. 如果用户在问机器人支持什么功能、命令怎么用，优先用 read 查看 BOT_CAPABILITIES.md，再回答。\n"
+        "3. 如果用户在问 Dota2，优先用 read 查看 DOTA_AGENT_GUIDE.md，再按需读取 DOTA_META_BRIEFS.json、DOTA_HERO_ALIASES.json、DOTA_HERO_BRIEFS.json。\n"
+        "4. 只有当用户明确在问最新、今日、当前、最近、官网、补丁、职业/高分最新趋势、天气、新闻等实时信息时，才使用 web_search。\n"
+        "5. 下面已经给出系统筛好的长期记忆命中项；如果为空，就不要凭空假设长期规则。\n"
+        "6. 当前消息和最近聊天上下文优先于长期记忆；长期记忆只用于稳定背景，不要扩写成新事实。\n"
+        "回答要求：\n"
+        "- 只输出适合 QQ 聊天展示的纯文本，不要使用 Markdown，不要代码块。\n"
+        "- 简短、自然、有群聊感，不要长篇说教。\n"
+        "- 不要输出思考过程、不要解释你调用了什么工具。\n\n"
+        f"最近群聊上下文：\n{_build_group_context_text(group_id)}\n\n"
+        f"系统筛好的长期记忆命中项：\n{_build_structured_memory_text(group_id, content)}\n\n"
+        f"当前用户消息：{content}"
     )
-    return collapse_text(await ask_router(prompt, channel=channel))
 
 
-async def _handle_web_answerable(content: str, *, channel: str) -> str:
-    search_data = await _tavily_search(content)
-    search_context = _build_tavily_context(search_data)
-    if not search_context:
-        return "我刚刚没有查到足够可靠的联网结果。"
-    prompt = (
-        f"当前日期：{time.strftime('%Y-%m-%d')}。\n"
-        "你是一个联网问答整理器。下面已经给你 Tavily 搜索结果。\n"
-        "请只基于这些搜索结果回答，不要使用你自己的旧知识补充，不要编造。\n"
-        "如果搜索结果明显不足以支撑结论，就直接简短说没查到足够可靠的信息。\n"
-        "要求：中文简短回答，1 到 3 句，优先给结论。\n\n"
-        f"用户问题：{content}\n\n"
-        f"Tavily 搜索结果：\n{search_context}"
+async def fetch_daily_news(*, channel: str, keyword: str = "") -> str:
+    del channel
+    date_text = time.strftime("%Y-%m-%d")
+    query = f"{date_text} 今日新闻 热点"
+    if keyword.strip():
+        query = f"{date_text} {keyword.strip()} 新闻 热点"
+    search_data = await _tavily_search(query)
+    news_text = _build_news_text_from_search(search_data, keyword=keyword)
+    if news_text:
+        return news_text
+    return "我刚刚没有查到足够可靠的今日新闻结果。"
+
+
+async def dispatch_group_prompt(
+    prompt: str, *, group_id: int, message_id: int
+) -> str:
+    ensure_group_openclaw_setup([group_id])
+    response = await ask_main(
+        _build_group_chat_prompt(prompt, group_id=group_id),
+        channel=message_channel(group_id, message_id, "group-chat"),
+        agent_id=group_chat_agent_id(group_id),
     )
-    return collapse_text(await ask_main(prompt, channel=channel))
-
-
-async def _handle_smalltalk(content: str, *, channel: str) -> str:
-    prompt = (
-        "你是一个群聊机器人。请对下面这句闲聊做一个简短中文回复。\n"
-        "要求：轻松自然，1 句即可，可以带 1 到 2 个恰到好处的 emoji。\n"
-        "不要复述用户消息。\n\n"
-        f"用户消息：{content}"
-    )
-    return collapse_text(await ask_router(prompt, channel=channel))
-
-
-RouteHandler = Callable[..., Awaitable[str]]
-ROUTE_HANDLERS: dict[str, RouteHandler] = {
-    "version_query": _handle_version_query,
-    "bot_abuse": _handle_bot_abuse,
-    "web_answerable": _handle_web_answerable,
-    "smalltalk": _handle_smalltalk,
-}
-
-
-async def route_group_prompt(prompt: str, *, group_id: int, message_id: int) -> tuple[str, str]:
-    route = await _classify_message(prompt, channel=message_channel(group_id, message_id, "classifier"))
-    handler = ROUTE_HANDLERS.get(route, _handle_smalltalk)
-    answer = collapse_text(await handler(prompt, channel=message_channel(group_id, message_id, route)))
+    answer = response.strip()
     if not answer:
         answer = "我收到消息了，但这次没组织出有效回复。"
-    return route, answer
+    return answer
+
+
+async def route_group_prompt(
+    prompt: str, *, group_id: int, message_id: int
+) -> tuple[str, str]:
+    return "group_chat", await dispatch_group_prompt(
+        prompt, group_id=group_id, message_id=message_id
+    )
